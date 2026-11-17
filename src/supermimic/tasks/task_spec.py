@@ -59,7 +59,7 @@ class TaskSpec:
 
   name: str
   goal_dim: int
-  extract_training_goal: ExtractFromMotion
+  extract_training_goal: ExtractFromMotion | None = None
   goal_specs: tuple[GoalSpec, ...] = ()
   build_inference_goal_obs: BuildInferenceGoalObs | None = None
   raw_goal_dim: int = 0

@@ -492,7 +492,8 @@ class GenCoordRepresentation(StateRepresentation):
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
-    self.fk = env.command_manager.get_term("motion").motion.fk
+    if "motion" in env.command_manager.active_terms:
+      self.fk = env.command_manager.get_term("motion").motion.fk
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)

@@ -19,12 +19,18 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
-from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.runners.supermimic_runner import (
+  SuperMimicRunnerCfg,
+  build_actor,
+  build_world_model,
+)
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.tasks.codyn import TASK_ID as CODYN_TASK_ID
+from supermimic.tasks.task_spec import TaskSpec
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -33,7 +39,9 @@ from supermimic.utils.wandb_artifacts import (
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
+  checkpoint_dir: Path | None = None
+  oscillator_checkpoint: str | None = None
   motion_file: str | None = None
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
@@ -51,18 +59,31 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
+  task_specs = None
+  initial_task = cfg.initial_task
+  if task_id == CODYN_TASK_ID:
+    if cfg.checkpoint_dir is None or cfg.oscillator_checkpoint is None:
+      raise SystemExit("CoDyn needs --checkpoint-dir and --oscillator-checkpoint.")
+    env_cfg.commands["codyn"].checkpoint = cfg.oscillator_checkpoint
+    runner_cfg = SuperMimicRunnerCfg(slot_mix={"codyn": 1.0})
+    model_dir = cfg.checkpoint_dir
+    motion_artifacts = []
+    initial_task = "codyn"
+  else:
+    import wandb
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+    if cfg.wandb_path is None:
+      raise SystemExit("This task requires --wandb-path.")
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    runner_cfg = load_runner_cfg(run.config)
+    model_dir = download_model_dir(run)
+    motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   check_representation_matches(task_id, runner_cfg.representation)
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
-  command_term = env_cfg.commands["motion"]
-  assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
-  if cfg.motion_file is not None:
+  command_term = env_cfg.commands.get("motion")
+  if isinstance(command_term, MotionCommandCfg) and cfg.motion_file is not None:
     expanded = os.path.expanduser(cfg.motion_file)
     if any(c in expanded for c in "*?[]"):
       files = sorted(glob.glob(expanded))
@@ -73,7 +94,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     command_term.motion_file = files
     motion_names = [Path(f).stem for f in files]
     print(f"[INFO] Using {len(files)} local motion(s)")
-  elif motion_artifacts:
+  elif isinstance(command_term, MotionCommandCfg) and motion_artifacts:
     motion_files = []
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
@@ -90,11 +111,12 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   representation = wm.representation
   dynamics = wm.dynamics
 
-  model_dir = download_model_dir(run)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
 
-  actor = build_actor(runner_cfg, wm, device)
+  if task_id == CODYN_TASK_ID:
+    task_specs = [TaskSpec("codyn", wm.num_goals)]
+  actor = build_actor(runner_cfg, wm, device, task_specs=task_specs)
   actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
   actor.eval()
 
@@ -117,7 +139,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
-      initial_task=cfg.initial_task,
+      initial_task=initial_task,
     ).run()
   else:
     SuperMimicViserViewer(
@@ -130,7 +152,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       motion_names=motion_names,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
-      initial_task=cfg.initial_task,
+      initial_task=initial_task,
     ).run()
 
   env.close()

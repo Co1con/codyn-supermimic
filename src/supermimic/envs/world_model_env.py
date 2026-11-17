@@ -59,7 +59,9 @@ class WorldModelEnv(ABC):
     self.max_step_reward = env.unwrapped.step_dt * sum(
       term.weight for term in env.cfg.rewards.values() if term.weight > 0.0
     )
+    self._bind_task(env, termination_softness)
 
+  def _bind_task(self, env: Any, termination_softness: float) -> None:
     # Reference-motion buffers.
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")

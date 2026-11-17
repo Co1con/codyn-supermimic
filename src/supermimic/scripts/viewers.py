@@ -59,11 +59,14 @@ class SuperMimicViewerMixin:
       for name, ts in self.task_specs.items()
       if ts.raw_goal_dim > 0
     }
-    motion = self.env.unwrapped.command_manager.get_term("motion").motion
+    manager = self.env.unwrapped.command_manager
+    self._motion_cmd = (
+      manager.get_term("motion") if "motion" in manager.active_terms else None
+    )
     self._replay_goal_tables: dict[str, torch.Tensor] = {
-      name: ts.precompute_replay_goal(motion).to(device)
+      name: ts.precompute_replay_goal(self._motion_cmd.motion).to(device)
       for name, ts in self.task_specs.items()
-      if ts.precompute_replay_goal is not None
+      if self._motion_cmd is not None and ts.precompute_replay_goal is not None
     }
     self._replay_mode: dict[str, bool] = dict.fromkeys(self._replay_goal_tables, False)
 
@@ -134,6 +137,8 @@ class SuperMimicViewerMixin:
     is enabled for the active task, the slider is overridden by the
     precomputed motion-derived command at the current motion time.
     """
+    if self.current_task == "codyn":
+      return curr_goals
     if self.current_task == "motion":
       return extract_actor_goal(curr_goals)
     ts = self.task_specs[self.current_task]
@@ -223,8 +228,10 @@ class SuperMimicViewerMixin:
         curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
 
         # Pre-step motion frame for the WM goal; env.step advances time_steps below.
-        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        wm_motion_times = motion_cmd.time_steps.clone()
+        motion_cmd = self._motion_cmd
+        wm_motion_times = (
+          motion_cmd.time_steps.clone() if motion_cmd is not None else None
+        )
 
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_aux is None or self.step_in_rollout == 0:
@@ -261,11 +268,13 @@ class SuperMimicViewerMixin:
         self._stats_steps += 1
 
         # Predict Next State (WM)
-        wm_goal, _ = self.representation.compute_wm_goal(
-          motion_cmd.motion,
-          wm_motion_times,
-          self.curr_wm_aux,
-        )
+        wm_goal = curr_goals
+        if motion_cmd is not None:
+          wm_goal, _ = self.representation.compute_wm_goal(
+            motion_cmd.motion,
+            wm_motion_times,
+            self.curr_wm_aux,
+          )
 
         # Closed-loop actor step on the WM-predicted state.
         wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)

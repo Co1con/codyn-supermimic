@@ -31,6 +31,7 @@ from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
+  TaskSpec,
   build_actor_obs_td,
   resolve_task_specs,
 )
@@ -177,7 +178,10 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
 
 def build_actor(
-  cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
+  cfg: SuperMimicRunnerCfg,
+  wm: WorldModel,
+  device: str,
+  task_specs: list[TaskSpec] | None = None,
 ) -> MultiEncoderAE:
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
@@ -189,7 +193,8 @@ def build_actor(
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
-    task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
+    task_specs=task_specs
+    or resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
     slot_mix=cfg.slot_mix,
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
@@ -273,8 +278,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
 
     self.action_manager = self.env.unwrapped.action_manager
-    self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    self.motion = self.motion_cmd.motion
+    manager = self.env.unwrapped.command_manager
+    self.motion_cmd = (
+      manager.get_term("motion") if "motion" in manager.active_terms else None
+    )
+    self.motion = self.motion_cmd.motion if self.motion_cmd is not None else None
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -406,9 +414,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     When given, ``actor_td`` is queued for the actor-normalizer update.
     """
-    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    motion_times = motion_cmd.time_steps.clone()
-
+    motion_times = (
+      self.motion_cmd.time_steps.clone() if self.motion_cmd is not None else None
+    )
     raw_actions = actions.detach().clone()
     prev_action = self.action_manager.action.clone()
 
@@ -424,10 +432,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": curr_states,
       "action": raw_actions,
       "prev_action": prev_action,
-      "motion_time": motion_times,
       "terminated": terminated,
       "truncated": truncated,
     }
+    if motion_times is not None:
+      fields["motion_time"] = motion_times
     if extra_fields:
       fields.update(extra_fields)
     self.replay_buffer.insert(TensorDict(fields, batch_size=[self.env.num_envs]))
@@ -503,8 +512,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   only in what goal modality their encoder consumes.
   """
 
+  world_model_env_cls = MultiTaskWorldModelEnv
+
+  def _make_policy_actor(self):
+    return build_actor(self.cfg, self._wm, self.device)
+
   def _init_policy(self) -> None:
-    actor = build_actor(self.cfg, self._wm, self.device)
+    actor = self._make_policy_actor()
     self._active_task_specs = [
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
@@ -523,7 +537,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     policy_cfg = self.cfg.policy
 
-    self.wm_env = MultiTaskWorldModelEnv(
+    self.wm_env = self.world_model_env_cls(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
@@ -739,6 +753,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"
+          and self.motion is not None
           and self.motion.time_step_total <= 15_000
         ):
           checkpoint_files += export_actor_as_onnx(
@@ -748,7 +763,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             run_name=wandb.run.name,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
+        if not wandb.run.settings._offline:
+          upload = uploader.submit(log_model_artifact, checkpoint_files)
 
     uploader.shutdown()
     self._cleanup()

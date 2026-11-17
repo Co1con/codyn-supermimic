@@ -11,12 +11,14 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 
 import supermimic.tasks  # noqa: F401
+from supermimic.runners.codyn_runner import CoDynRunner
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.codyn import TASK_ID as CODYN_TASK_ID
 
 
 @dataclass
@@ -29,10 +31,14 @@ class TrainConfig:
   device: str | None = None
   registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"
   motion_file: str | None = None
+  oscillator_checkpoint: str | None = None
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id, play=False)
+    if task_id == CODYN_TASK_ID:
+      runner = SuperMimicRunnerCfg(slot_mix={"codyn": 1.0}, sampling_mode="start")
+      return TrainConfig(env=env_cfg, runner=runner, num_envs=64, registry_name=None)
     return TrainConfig(
       env=env_cfg,
       runner=SuperMimicRunnerCfg(),
@@ -57,6 +63,17 @@ def main() -> None:
 
   device = setup_device(args.device)
   print(f"[INFO] Loading environment: {chosen_task}")
+
+  if chosen_task == CODYN_TASK_ID:
+    if not args.oscillator_checkpoint:
+      raise SystemExit("CoDyn requires --oscillator-checkpoint.")
+    if args.runner.representation != "gencoord":
+      raise SystemExit("CoDyn requires the gencoord representation.")
+    args.env.commands["codyn"].checkpoint = args.oscillator_checkpoint
+    os.environ.setdefault("WANDB_MODE", "offline")
+    env = create_env(args.env, args.num_envs, device)
+    CoDynRunner(env=env, cfg=args.runner, task_id=chosen_task, device=device).run()
+    return
 
   if args.motion_file:
     # Local motions handed straight to MotionLoader (globs/concatenates).
